@@ -1,192 +1,168 @@
-import os
+import spacy
 import pickle
 import numpy as np
-import spacy
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import NMF
 from transformers import pipeline
-import tensorflow as tf
-from keras.models import load_model
-import concurrent.futures
 
-# Load models only once
-nlp = None
-topic_model = None
-vectorizer = None
-sentiment_model = None
-summarizer = None
-sentiment_analyzer = None
-
-def load_models():
-    global nlp, sentiment_model
-    
-    # Load spaCy
-    try:
-        if nlp is None:
-            nlp = spacy.load("en_core_web_sm")
-    except:
-        try:
-            os.system("python -m spacy download en_core_web_sm")
-            nlp = spacy.load("en_core_web_sm")
-        except Exception as e:
-            print(f"Error loading spaCy model: {e}")
-    
-    # Load your pre-trained sentiment model
-    try:
-        if sentiment_model is None and os.path.exists('models/sentiment_model.keras'):
-            sentiment_model = load_model('models/sentiment_model.keras')
-    except Exception as e:
-        print(f"Error loading sentiment model: {e}")
-        
-    # Load any insights from your pickle file
-    try:
-        if os.path.exists('models/document_insights.pkl'):
-            with open('models/document_insights.pkl', 'rb') as f:
-                pre_trained_insights = pickle.load(f)
-                # Use these insights in your analysis process
-    except Exception as e:
-        print(f"Error loading document insights: {e}")
+# Initialize spaCy model
+try:
+    nlp = spacy.load("en_core_web_sm")
+except:
+    import os
+    os.system("python -m spacy download en_core_web_sm")
+    nlp = spacy.load("en_core_web_sm")
 
 def extract_insights_with_spacy(text):
-    """Extract insights using spaCy"""
-    if not nlp:
-        return {}, "spaCy model not loaded."
+    """
+    Extract insights using spaCy
     
-    # Process only up to 100,000 characters to avoid memory issues
-    text = text[:100000]
-    doc = nlp(text)
-    
-    entities = {ent.text: ent.label_ for ent in doc.ents}
-    noun_chunks = [chunk.text for chunk in doc.noun_chunks]
-    
-    # Get important sentences based on entity density
-    sentences = list(doc.sents)
-    if sentences:
+    Args:
+        text: Text to analyze
+        
+    Returns:
+        tuple: (insights dict, summary string)
+    """
+    try:
+        doc = nlp(text[:100000])  # Limit to avoid memory issues
+        entities = {ent.text: ent.label_ for ent in doc.ents}
+        noun_chunks = [chunk.text for chunk in doc.noun_chunks]
+        sentences = list(doc.sents)
         important_sentences = sorted(
             sentences,
             key=lambda s: sum(1 for ent in doc.ents if ent.start >= s.start and ent.end <= s.end),
             reverse=True
         )[:3]
         summary = ' '.join([sent.text for sent in important_sentences])
-    else:
-        summary = "No complete sentences found."
 
-    insights = {
-        'entities': entities,
-        'key_phrases': noun_chunks[:10],
-        'summary': summary
-    }
+        insights = {
+            'entities': entities,
+            'key_phrases': noun_chunks[:10],
+            'summary': summary
+        }
 
-    return insights, f"Document contains {len(entities)} named entities including {', '.join(list(entities.keys())[:5]) if entities else 'none'}. Key topics focus on {', '.join(noun_chunks[:3]) if noun_chunks else 'unknown topics'}."
+        return insights, f"Document contains {len(entities)} named entities including {', '.join(list(entities.keys())[:5])}. Key topics focus on {', '.join(noun_chunks[:3])}."
+    except Exception as e:
+        print(f"Error extracting insights with spaCy: {e}")
+        return {}, "Could not extract insights with spaCy."
 
-def extract_insights_with_sklearn(text, num_topics=3):
-    """Extract topics using sklearn NMF"""
-    if not topic_model or not vectorizer:
-        return [], "Topic model not loaded.", None
+def extract_insights_with_sklearn(text, model_cache=None, num_topics=3):
+    """
+    Extract topics using scikit-learn
     
-    try:
-        # Process with pre-trained topic model
-        dtm = vectorizer.transform([text])
-        topic_values = topic_model.transform(dtm)[0]
+    Args:
+        text: Text to analyze
+        model_cache: Dictionary of cached models
+        num_topics: Number of topics to extract
         
-        # Get top topics
-        topics = []
+    Returns:
+        tuple: (topics list, summary string, model filename)
+    """
+    try:
+        # Use cached model if available
+        if model_cache and 'topic_model' in model_cache:
+            nmf_model, vectorizer = model_cache['topic_model']
+            dtm = vectorizer.transform([text])
+        else:
+            # Create new model
+            vectorizer = TfidfVectorizer(max_df=0.95, min_df=2, stop_words='english')
+            dtm = vectorizer.fit_transform([text])
+            nmf_model = NMF(n_components=num_topics, random_state=42)
+            nmf_model.fit(dtm)
+            
+            # Save model
+            model_filename = 'topic_model.pkl'
+            with open(model_filename, 'wb') as f:
+                pickle.dump((nmf_model, vectorizer), f)
+        
+        # Extract topics
         feature_names = vectorizer.get_feature_names_out()
-        for topic_idx, topic in enumerate(topic_model.components_):
+        topics = []
+        for topic_idx, topic in enumerate(nmf_model.components_):
             top_words_idx = topic.argsort()[:-11:-1]
             top_words = [feature_names[i] for i in top_words_idx]
             topics.append(top_words)
         
         topic_insights = f"Main topics: {', '.join([' & '.join(topic[:3]) for topic in topics])}"
-        return topics, topic_insights
+        return topics, topic_insights, 'topic_model.pkl'
     except Exception as e:
-        print(f"Error in topic extraction: {e}")
-        return [], "Could not extract topics due to insufficient text data"
+        print(f"Error extracting insights with scikit-learn: {e}")
+        return [], "Could not extract topics due to insufficient text data", None
 
-def extract_insights_with_transformers(text):
-    """Extract insights using transformers"""
-    if not sentiment_analyzer or not summarizer:
-        return {}, "Transformer models not loaded.", None
+def extract_insights_with_transformers(text, model_cache=None):
+    """
+    Extract insights using transformers
     
+    Args:
+        text: Text to analyze
+        model_cache: Dictionary of cached models
+        
+    Returns:
+        tuple: (insights dict, summary string, keras model path)
+    """
     try:
-        # Process text in chunks to avoid memory issues
-        chunks = [text[i:i+512] for i in range(0, min(len(text), 5000), 512)]
-        sentiments = []
-        
-        # Process in smaller batches
-        for i in range(0, len(chunks), 5):
-            batch = chunks[i:i+5]
-            batch_sentiments = [sentiment_analyzer(chunk) for chunk in batch if chunk.strip()]
-            sentiments.extend(batch_sentiments)
-        
+        sentiment_analyzer = pipeline('sentiment-analysis')
+        chunks = [text[i:i+512] for i in range(0, len(text), 512)]
+        sentiments = [sentiment_analyzer(chunk) for chunk in chunks[:5] if chunk.strip()]  # Limit to first 5 chunks
+
         if sentiments:
-            sentiment_labels = [s[0]['label'] for s in sentiments if s]
-            if sentiment_labels:
-                overall_sentiment = max(set(sentiment_labels), key=sentiment_labels.count)
-            else:
-                overall_sentiment = "NEUTRAL"
-                
-            # Summarize only if text is long enough
+            overall_sentiment = max(set([s[0]['label'] for s in sentiments if s]),
+                                  key=[s[0]['label'] for s in sentiments if s].count)
+            
+            # Only run summarizer if text is long enough
             if len(text) > 100:
+                summarizer = pipeline('summarization')
                 summary = summarizer(text[:1024], max_length=100, min_length=30, do_sample=False)
                 summary_text = summary[0]['summary_text']
             else:
                 summary_text = text
-                
+
             return {
                 'sentiment': overall_sentiment,
                 'summary': summary_text
-            }, f"Document sentiment: {overall_sentiment}. {summary_text[:100]}..."
+            }, f"Document sentiment: {overall_sentiment}. {summary_text[:100]}...", 'sentiment_model.keras'
         else:
-            return {'sentiment': 'NEUTRAL', 'summary': text[:100]}, "Document appears neutral in tone."
+            return {'sentiment': 'NEUTRAL', 'summary': text[:100]}, "Document appears neutral in tone.", None
     except Exception as e:
         print(f"Error in transformer processing: {e}")
-        return {'sentiment': 'UNKNOWN', 'summary': text[:100]}, "Unable to determine document sentiment."
+        return {'sentiment': 'UNKNOWN', 'summary': text[:100]}, "Unable to determine document sentiment.", None
 
-def generate_insights(text, fast_mode=True):
-    """Generate comprehensive insights from text"""
-    # Load models
-    model_status = load_models()
-    print(f"Model status: {model_status}")
+def generate_comprehensive_insights(text, file_path, images=None, model_cache=None):
+    """
+    Generate comprehensive insights from text
     
-    results = {}
-    summary_parts = []
+    Args:
+        text: Text to analyze
+        file_path: Path to the PDF file
+        images: List of images from the PDF
+        model_cache: Dictionary of cached models
+        
+    Returns:
+        dict: Dictionary of insights
+    """
+    print("Generating insights...")
     
-    # Use concurrent processing for faster insights
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        spacy_future = executor.submit(extract_insights_with_spacy, text)
-        topic_future = executor.submit(extract_insights_with_sklearn, text)
-        
-        # Only run transformer-based analysis if not in fast mode
-        if not fast_mode:
-            transformer_future = executor.submit(extract_insights_with_transformers, text)
-        
-        # Get spaCy results
-        try:
-            spacy_insights, spacy_summary = spacy_future.result()
-            results['spacy'] = spacy_insights
-            summary_parts.append(spacy_summary)
-        except Exception as e:
-            print(f"Error in spaCy processing: {e}")
-        
-        # Get topic modeling results
-        try:
-            topics, topic_summary = topic_future.result()
-            results['topics'] = topics
-            summary_parts.append(topic_summary)
-        except Exception as e:
-            print(f"Error in topic modeling: {e}")
-        
-        # Get transformer results if not in fast mode
-        if not fast_mode:
-            try:
-                transformer_results, transformer_summary = transformer_future.result()
-                results['transformer'] = transformer_results
-                summary_parts.append(transformer_summary)
-            except Exception as e:
-                print(f"Error in transformer processing: {e}")
+    spacy_insights, spacy_summary = extract_insights_with_spacy(text)
+    topics, topic_summary, _ = extract_insights_with_sklearn(text, model_cache)
+    transformer_results, transformer_summary, _ = extract_insights_with_transformers(text, model_cache)
     
-    # Compile summary
-    insights_summary = "\n".join(summary_parts)
-    
-    return results, insights_summary
+    insights_summary = f"""
+    DOCUMENT INSIGHTS SUMMARY:
+
+    {spacy_summary}
+
+    {topic_summary}
+
+    {transformer_summary}
+    """
+
+    detailed_insights = {
+        'summary': insights_summary.strip(),
+        'entities': spacy_insights.get('entities', {}),
+        'key_phrases': spacy_insights.get('key_phrases', []),
+        'topics': topics,
+        'sentiment': transformer_results.get('sentiment', 'NEUTRAL'),
+        'transformer_summary': transformer_results.get('summary', '')
+    }
+
+    return detailed_insights
