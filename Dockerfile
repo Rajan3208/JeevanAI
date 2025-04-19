@@ -18,9 +18,9 @@ WORKDIR /app
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python dependencies
+# Upgrade pip and install dependencies with increased timeout and retries
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
+    pip install --no-cache-dir --timeout 1000 --retries 10 -r requirements.txt
 
 # Download spaCy model
 RUN python -m spacy download en_core_web_sm
