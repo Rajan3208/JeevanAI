@@ -129,14 +129,14 @@ def process_file_async(file_id, file_path):
                     easyocr_text = extract_text_with_easyocr(images)
                     combined_text = pytesseract_text + "\n" + easyocr_text
         
-        # Generate insights with a timeout
+        # Generate insights with a timeout - INCREASED FROM 60 TO 120 SECONDS
         logger.info(f"Generating insights for {file_id}")
         insights = generate_comprehensive_insights(
             combined_text, 
             file_path, 
             None,  # Only pass images if needed
             model_cache,
-            timeout=60  # Set a timeout for inference
+            timeout=120  # Increased timeout for inference from 60 to 120
         )
         
         # Prepare response
