@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Configuration
-app.config['UPLOAD_FOLDER'] = 'uploads'
-app.config['MODELS_FOLDER'] = 'models'
+app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', 'uploads')
+app.config['MODELS_FOLDER'] = os.environ.get('MODELS_FOLDER', 'models')
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload size
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['MODELS_FOLDER'], exist_ok=True)
@@ -35,16 +35,29 @@ results_cache = {}
 # Model cache for loaded models
 model_cache = {}
 
-# Initialize models at startup
-@app.before_first_request
+# Initialize models function - will be called separately
 def initialize_models():
     try:
         logger.info("Loading models...")
         global model_cache
         model_cache = load_models(app.config['MODELS_FOLDER'])
         logger.info(f"Loaded {len(model_cache)} models successfully")
+        return True
     except Exception as e:
         logger.error(f"Error loading models: {str(e)}")
+        return False
+
+# Call model initialization during startup, but don't block the app from starting
+@app.before_request
+def ensure_models_loaded():
+    global model_cache
+    if not model_cache:
+        try:
+            # Try loading models if not already loaded
+            initialize_models()
+        except Exception as e:
+            logger.error(f"Error loading models: {str(e)}")
+            # Continue without models - we'll handle missing models in the processing functions
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -68,22 +81,24 @@ def upload_file():
             file.filename.lower().endswith(('.png', '.jpg', '.jpeg'))):
         return jsonify({'error': 'File must be a PDF or image (PNG, JPG)'}), 400
     
-    # Create a unique filename
-    unique_filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
-    file.save(file_path)
-    
-    logger.info(f"File uploaded: {unique_filename}")
-    
     try:
+        # Create a unique filename
+        unique_filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        file.save(file_path)
+        
+        logger.info(f"File uploaded: {unique_filename}")
+        
         # Return file ID for the next step
         return jsonify({
             'message': 'File uploaded successfully',
             'file_id': unique_filename
         }), 200
     except Exception as e:
-        os.remove(file_path)  # Clean up on error
         logger.error(f"Upload error: {str(e)}")
+        # Make sure we don't try to remove a file that wasn't created
+        if 'file_path' in locals() and os.path.exists(file_path):
+            os.remove(file_path)
         return jsonify({'error': str(e)}), 500
 
 def process_file_async(file_id, file_path):
@@ -95,24 +110,30 @@ def process_file_async(file_id, file_path):
         # Check if file is image or PDF
         is_image = file_path.lower().endswith(('.png', '.jpg', '.jpeg'))
         
+        # Set default empty values
+        pypdf_text = ""
+        langchain_pdf_text = ""
+        pytesseract_text = ""
+        easyocr_text = ""
+        combined_text = ""
+        
         # For images, we only need OCR methods
         if is_image:
             logger.info(f"Processing image file: {file_id}")
             images = [file_path]
-            pypdf_text = ""
-            langchain_pdf_text = ""
             
             try:
                 pytesseract_text = extract_text_with_pytesseract(images)
+                logger.info(f"Pytesseract extraction completed with {len(pytesseract_text)} chars")
             except Exception as e:
                 logger.warning(f"Pytesseract extraction failed: {str(e)}")
-                pytesseract_text = ""
                 
             try:
+                results_cache[file_id]['status'] = 'extracting_with_easyocr'
                 easyocr_text = extract_text_with_easyocr(images)
+                logger.info(f"EasyOCR extraction completed with {len(easyocr_text)} chars")
             except Exception as e:
                 logger.warning(f"EasyOCR extraction failed: {str(e)}")
-                easyocr_text = ""
             
             combined_text = pytesseract_text + "\n" + easyocr_text
             
@@ -122,10 +143,11 @@ def process_file_async(file_id, file_path):
             logger.info(f"Processing PDF file: {file_id}")
             
             try:
+                results_cache[file_id]['status'] = 'extracting_with_pypdf'
                 pypdf_text = extract_text_with_pyPDF(file_path)
+                logger.info(f"PyPDF extraction completed with {len(pypdf_text)} chars")
             except Exception as e:
                 logger.warning(f"PyPDF extraction failed: {str(e)}")
-                pypdf_text = ""
             
             if len(pypdf_text.strip()) > 200:
                 logger.info(f"Using PyPDF extraction for {file_id}")
@@ -133,16 +155,18 @@ def process_file_async(file_id, file_path):
             else:
                 logger.info(f"PyPDF extraction insufficient, trying Langchain for {file_id}")
                 try:
+                    results_cache[file_id]['status'] = 'extracting_with_langchain'
                     langchain_pdf_text = extract_text_with_langchain_pdf(file_path)
+                    logger.info(f"Langchain extraction completed with {len(langchain_pdf_text)} chars")
                 except Exception as e:
                     logger.warning(f"Langchain extraction failed: {str(e)}")
-                    langchain_pdf_text = ""
                 
                 if len(langchain_pdf_text.strip()) > 200:
                     combined_text = langchain_pdf_text
                 else:
                     logger.info(f"Text extraction failed, using OCR for {file_id}")
                     try:
+                        results_cache[file_id]['status'] = 'extracting_with_ocr'
                         images = convert_pdf_to_images(file_path)
                         pytesseract_text = extract_text_with_pytesseract(images)
                         easyocr_text = extract_text_with_easyocr(images)
@@ -151,6 +175,15 @@ def process_file_async(file_id, file_path):
                         logger.error(f"OCR extraction failed: {str(e)}")
                         combined_text = pypdf_text + "\n" + langchain_pdf_text
         
+        # Ensure we have at least some text
+        if len(combined_text.strip()) < 10:
+            logger.warning(f"Very little text extracted from file: {file_id}")
+            results_cache[file_id] = {
+                'status': 'error',
+                'error': 'Could not extract sufficient text from document'
+            }
+            return
+            
         results_cache[file_id]['status'] = 'extracting_insights'
         
         logger.info(f"Generating insights for {file_id} with {len(combined_text)} characters of text")
@@ -204,6 +237,7 @@ def process_file_async(file_id, file_path):
         try:
             if os.path.exists(file_path):
                 os.remove(file_path)
+                logger.info(f"Removed temporary file: {file_path}")
         except Exception as e:
             logger.error(f"Error removing file {file_path}: {str(e)}")
 
@@ -262,6 +296,9 @@ def check_status(file_id):
 def upload_models_to_gcs():
     try:
         data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Invalid JSON'}), 400
+            
         bucket_name = data.get('bucket_name')
         
         if not bucket_name:
@@ -305,6 +342,10 @@ def cleanup_cache():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
+    # Initialize models before starting the server
+    initialize_models()
+    
     # Use this for local development
     port = int(os.environ.get('PORT', 8080))
-    app.run(debug=True, host='0.0.0.0', port=port)
+    # In production, we should use a proper WSGI server instead of the Flask dev server
+    app.run(host='0.0.0.0', port=port, threaded=True)
