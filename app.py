@@ -26,10 +26,14 @@ os.makedirs(app.config['MODELS_FOLDER'], exist_ok=True)
 # Load models at startup
 model_cache = {}
 
-@app.before_first_request
+# Replace the @app.before_first_request with this approach
 def load_all_models():
     global model_cache
     model_cache = load_models(app.config['MODELS_FOLDER'])
+
+# Execute at startup time
+with app.app_context():
+    load_all_models()
 
 @app.route('/health', methods=['GET'])
 def health_check():
