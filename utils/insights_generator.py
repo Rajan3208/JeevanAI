@@ -1,6 +1,9 @@
 import spacy
 import pickle
 import numpy as np
+import time
+import signal
+from functools import wraps
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.decomposition import NMF
 from transformers import pipeline
@@ -12,6 +15,26 @@ except:
     import os
     os.system("python -m spacy download en_core_web_sm")
     nlp = spacy.load("en_core_web_sm")
+
+# Timeout decorator
+def timeout_handler(signum, frame):
+    raise TimeoutError("Function execution timed out")
+
+def with_timeout(timeout_seconds):
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            # Set the timeout handler
+            signal.signal(signal.SIGALRM, timeout_handler)
+            signal.alarm(timeout_seconds)
+            try:
+                result = func(*args, **kwargs)
+            finally:
+                # Cancel the alarm
+                signal.alarm(0)
+            return result
+        return wrapper
+    return decorator
 
 def extract_insights_with_spacy(text):
     """
@@ -127,7 +150,7 @@ def extract_insights_with_transformers(text, model_cache=None):
         print(f"Error in transformer processing: {e}")
         return {'sentiment': 'UNKNOWN', 'summary': text[:100]}, "Unable to determine document sentiment.", None
 
-def generate_comprehensive_insights(text, file_path, images=None, model_cache=None):
+def generate_comprehensive_insights(text, file_path, images=None, model_cache=None, timeout=120):
     """
     Generate comprehensive insights from text
     
@@ -136,33 +159,96 @@ def generate_comprehensive_insights(text, file_path, images=None, model_cache=No
         file_path: Path to the PDF file
         images: List of images from the PDF
         model_cache: Dictionary of cached models
+        timeout: Maximum time in seconds for insights generation (default: 120)
         
     Returns:
         dict: Dictionary of insights
     """
-    print("Generating insights...")
+    print(f"Generating insights with timeout of {timeout} seconds...")
     
-    spacy_insights, spacy_summary = extract_insights_with_spacy(text)
-    topics, topic_summary, _ = extract_insights_with_sklearn(text, model_cache)
-    transformer_results, transformer_summary, _ = extract_insights_with_transformers(text, model_cache)
+    # Wrap the insights generation in timeout handling
+    start_time = time.time()
     
-    insights_summary = f"""
-    DOCUMENT INSIGHTS SUMMARY:
+    try:
+        # Use separate timeouts for each method to ensure we get some results
+        max_time_per_method = timeout / 3
+        
+        # First try spaCy (fastest)
+        spacy_insights, spacy_summary = extract_insights_with_spacy(text)
+        
+        # Check remaining time
+        elapsed = time.time() - start_time
+        remaining_time = timeout - elapsed
+        
+        if remaining_time <= 0:
+            return {
+                'summary': spacy_summary.strip(),
+                'entities': spacy_insights.get('entities', {}),
+                'key_phrases': spacy_insights.get('key_phrases', []),
+                'topics': [],
+                'sentiment': 'UNKNOWN',
+                'transformer_summary': ''
+            }
+        
+        # Then try sklearn
+        topics, topic_summary, _ = extract_insights_with_sklearn(text, model_cache)
+        
+        # Check remaining time again
+        elapsed = time.time() - start_time
+        remaining_time = timeout - elapsed
+        
+        if remaining_time <= 0:
+            return {
+                'summary': f"{spacy_summary}\n\n{topic_summary}".strip(),
+                'entities': spacy_insights.get('entities', {}),
+                'key_phrases': spacy_insights.get('key_phrases', []),
+                'topics': topics,
+                'sentiment': 'UNKNOWN',
+                'transformer_summary': ''
+            }
+        
+        # Finally try transformers (slowest)
+        transformer_results, transformer_summary, _ = extract_insights_with_transformers(text, model_cache)
+        
+        insights_summary = f"""
+        DOCUMENT INSIGHTS SUMMARY:
 
-    {spacy_summary}
+        {spacy_summary}
 
-    {topic_summary}
+        {topic_summary}
 
-    {transformer_summary}
-    """
+        {transformer_summary}
+        """
 
-    detailed_insights = {
-        'summary': insights_summary.strip(),
-        'entities': spacy_insights.get('entities', {}),
-        'key_phrases': spacy_insights.get('key_phrases', []),
-        'topics': topics,
-        'sentiment': transformer_results.get('sentiment', 'NEUTRAL'),
-        'transformer_summary': transformer_results.get('summary', '')
-    }
+        detailed_insights = {
+            'summary': insights_summary.strip(),
+            'entities': spacy_insights.get('entities', {}),
+            'key_phrases': spacy_insights.get('key_phrases', []),
+            'topics': topics,
+            'sentiment': transformer_results.get('sentiment', 'NEUTRAL'),
+            'transformer_summary': transformer_results.get('summary', '')
+        }
 
-    return detailed_insights
+        return detailed_insights
+        
+    except TimeoutError:
+        print(f"Insights generation timed out after {timeout} seconds")
+        # Return whatever we've got so far
+        return {
+            'summary': "Analysis timed out. Partial results available.",
+            'entities': spacy_insights.get('entities', {}) if 'spacy_insights' in locals() else {},
+            'key_phrases': spacy_insights.get('key_phrases', []) if 'spacy_insights' in locals() else [],
+            'topics': topics if 'topics' in locals() else [],
+            'sentiment': 'UNKNOWN',
+            'transformer_summary': ''
+        }
+    except Exception as e:
+        print(f"Error generating comprehensive insights: {e}")
+        return {
+            'summary': f"Error generating insights: {str(e)}",
+            'entities': {},
+            'key_phrases': [],
+            'topics': [],
+            'sentiment': 'UNKNOWN',
+            'transformer_summary': ''
+        }
