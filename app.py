@@ -84,6 +84,8 @@ def upload_file():
         logger.error(f"Upload error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
+# (unchanged imports and setup...)
+
 def process_file_async(file_id, file_path):
     """Process file asynchronously and store results in cache"""
     try:
@@ -96,11 +98,10 @@ def process_file_async(file_id, file_path):
         # For images, we only need OCR methods
         if is_image:
             logger.info(f"Processing image file: {file_id}")
-            images = [file_path]  # For images, just use the file directly
+            images = [file_path]
             pypdf_text = ""
             langchain_pdf_text = ""
             
-            # Added try-except blocks to ensure robustness
             try:
                 pytesseract_text = extract_text_with_pytesseract(images)
             except Exception as e:
@@ -115,27 +116,21 @@ def process_file_async(file_id, file_path):
             
             combined_text = pytesseract_text + "\n" + easyocr_text
             
-            # Check if we got any text
             if len(combined_text.strip()) < 50:
                 logger.warning(f"Very little text extracted from image: {file_id}")
-                # Keep processing but log the warning
         else:
-            # For PDFs, use optimized extraction approach
             logger.info(f"Processing PDF file: {file_id}")
             
-            # Try PyPDF first as it's fastest
             try:
                 pypdf_text = extract_text_with_pyPDF(file_path)
             except Exception as e:
                 logger.warning(f"PyPDF extraction failed: {str(e)}")
                 pypdf_text = ""
             
-            # If PyPDF gets sufficient text, skip other methods
-            if len(pypdf_text.strip()) > 200:  # Higher threshold for meaningful text
+            if len(pypdf_text.strip()) > 200:
                 logger.info(f"Using PyPDF extraction for {file_id}")
                 combined_text = pypdf_text
             else:
-                # Fall back to langchain
                 logger.info(f"PyPDF extraction insufficient, trying Langchain for {file_id}")
                 try:
                     langchain_pdf_text = extract_text_with_langchain_pdf(file_path)
@@ -146,7 +141,6 @@ def process_file_async(file_id, file_path):
                 if len(langchain_pdf_text.strip()) > 200:
                     combined_text = langchain_pdf_text
                 else:
-                    # Only if both fail, use OCR (most time-consuming)
                     logger.info(f"Text extraction failed, using OCR for {file_id}")
                     try:
                         images = convert_pdf_to_images(file_path)
@@ -155,23 +149,19 @@ def process_file_async(file_id, file_path):
                         combined_text = pytesseract_text + "\n" + easyocr_text
                     except Exception as e:
                         logger.error(f"OCR extraction failed: {str(e)}")
-                        # Use whatever text we have so far
                         combined_text = pypdf_text + "\n" + langchain_pdf_text
         
-        # Update status to show text extraction complete
         results_cache[file_id]['status'] = 'extracting_insights'
         
-        # Generate insights with timeout
         logger.info(f"Generating insights for {file_id} with {len(combined_text)} characters of text")
         insights = generate_comprehensive_insights(
             combined_text, 
             file_path, 
-            None,  # Only pass images if needed
+            None, 
             model_cache,
-            timeout=180  # Timeout for inference (180 seconds)
+            timeout=180
         )
         
-        # If insights generation failed, provide at least some basic information
         if not insights or not isinstance(insights, dict):
             logger.warning(f"Insights generation returned invalid data for {file_id}")
             insights = {
@@ -180,7 +170,7 @@ def process_file_async(file_id, file_path):
                 'topics': [],
                 'sentiment': 'NEUTRAL'
             }
-        
+
         # Prepare response
         result = {
             'file_id': file_id,
@@ -189,16 +179,20 @@ def process_file_async(file_id, file_path):
             'insights': insights.get('summary', "No summary available"),
             'entities': list(insights.get('entities', {}).keys())[:10],
             'topics': insights.get('topics', [])[:3],
-            'sentiment': insights.get('sentiment', 'NEUTRAL')
+            'sentiment': insights.get('sentiment', 'NEUTRAL'),
+            'key_phrases': insights.get('key_phrases', [])[:7]
         }
-        
-        # Update cache with completed result
+
+        if 'transformer_summary' in insights and insights['transformer_summary']:
+            result['detailed_summary'] = insights['transformer_summary']
+
         results_cache[file_id] = {
             'status': 'complete',
             'result': result
         }
+
         logger.info(f"Processing complete for {file_id}")
-        
+
     except Exception as e:
         logger.error(f"Error processing {file_id}: {str(e)}")
         results_cache[file_id] = {
@@ -206,15 +200,12 @@ def process_file_async(file_id, file_path):
             'error': str(e)
         }
     finally:
-        # Clean up uploaded file - but only after processing is complete
         try:
             if os.path.exists(file_path):
-                # For debugging large documents, optionally keep files temporarily
-                # Uncomment next line to retain files for debugging
-                # logger.info(f"Keeping file for debugging: {file_path}")
                 os.remove(file_path)
         except Exception as e:
             logger.error(f"Error removing file {file_path}: {str(e)}")
+
 
 @app.route('/api/analyze/<file_id>', methods=['GET'])
 def analyze_file(file_id):
