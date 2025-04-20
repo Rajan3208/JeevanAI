@@ -16,21 +16,27 @@ from utils.text_extractor import (
 from utils.insights_generator import generate_comprehensive_insights
 from utils.model_handler import load_models, upload_to_gcs
 
+# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": "*"}})  # Adjust origins in production
 
+# Configuration
 app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', '/tmp/uploads')
 app.config['MODELS_FOLDER'] = os.environ.get('MODELS_FOLDER', 'models')
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload size
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['MODELS_FOLDER'], exist_ok=True)
 
+# Results cache for async processing
 results_cache = {}
+
+# Model cache for loaded models
 model_cache = {}
 
+# Initialize models function
 def initialize_models():
     try:
         logger.info("Loading models...")
@@ -42,11 +48,15 @@ def initialize_models():
         logger.error(f"Error loading models: {str(e)}")
         return False
 
+# Call model initialization during startup
 @app.before_request
 def ensure_models_loaded():
     global model_cache
     if not model_cache:
-        initialize_models()
+        try:
+            initialize_models()
+        except Exception as e:
+            logger.error(f"Error loading models: {str(e)}")
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -94,8 +104,8 @@ def upload_file():
             logger.info(f"Removed failed upload: {file_path}")
         return jsonify({'error': f"Server error: {str(e)}"}), 500
 
-def process_file_async(file_id, file_path, result_queue):
-    """Process file and store results in queue"""
+def process_file_async(file_id, file_path, result_queue=None):
+    """Process file asynchronously and store results in cache"""
     try:
         logger.info(f"Starting async processing for {file_id}")
         results_cache[file_id]['status'] = 'processing'
@@ -177,7 +187,8 @@ def process_file_async(file_id, file_path, result_queue):
                 'status': 'error',
                 'error': 'Could not extract sufficient text from document'
             }
-            result_queue.put(results_cache[file_id])
+            if result_queue:
+                result_queue.put(results_cache[file_id])
             return
             
         results_cache[file_id]['status'] = 'extracting_insights'
@@ -220,7 +231,8 @@ def process_file_async(file_id, file_path, result_queue):
         }
 
         logger.info(f"Processing complete for {file_id}")
-        result_queue.put(results_cache[file_id])
+        if result_queue:
+            result_queue.put(results_cache[file_id])
 
     except Exception as e:
         logger.error(f"Error processing {file_id}: {str(e)}", exc_info=True)
@@ -228,7 +240,8 @@ def process_file_async(file_id, file_path, result_queue):
             'status': 'error',
             'error': str(e)
         }
-        result_queue.put(results_cache[file_id])
+        if result_queue:
+            result_queue.put(results_cache[file_id])
     finally:
         try:
             if os.path.exists(file_path):
@@ -261,11 +274,21 @@ def analyze_file(file_id):
     
     results_cache[file_id] = {'status': 'initializing'}
     
-    # Use multiprocessing instead of threading
+    # Use multiprocessing for async processing
     result_queue = Queue()
     process = Process(target=process_file_async, args=(file_id, file_path, result_queue))
     process.daemon = True
     process.start()
+    
+    # For synchronous processing (uncomment to use instead of multiprocessing):
+    # process_file_async(file_id, file_path)
+    # cache_entry = results_cache[file_id]
+    # if cache_entry['status'] == 'complete':
+    #     return jsonify(cache_entry['result']), 200
+    # elif cache_entry['status'] == 'error':
+    #     return jsonify({'error': cache_entry.get('error', 'Unknown error'), 'file_id': file_id}), 500
+    # else:
+    #     return jsonify({'status': 'processing', 'stage': cache_entry['status'], 'file_id': file_id}), 202
     
     return jsonify({'status': 'processing', 'file_id': file_id}), 202
 
