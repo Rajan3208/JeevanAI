@@ -12,13 +12,30 @@ from sklearn.decomposition import NMF
 
 logger = logging.getLogger(__name__)
 
-# Initialize spaCy model
+# Initialize spaCy model with better error handling
+def load_spacy_model():
+    try:
+        return spacy.load("en_core_web_sm")
+    except OSError:
+        try:
+            import subprocess
+            logger.info("Downloading spaCy model...")
+            subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"], 
+                         check=True, capture_output=True)
+            return spacy.load("en_core_web_sm")
+        except Exception as e:
+            logger.error(f"Failed to download spaCy model: {e}")
+            # Create a minimal blank model as fallback
+            return spacy.blank("en")
+
+# Load the model on module import, but don't crash if it fails
 try:
-    nlp = spacy.load("en_core_web_sm")
-except:
-    import os
-    os.system("python -m spacy download en_core_web_sm")
-    nlp = spacy.load("en_core_web_sm")
+    nlp = load_spacy_model()
+    logger.info("SpaCy model loaded successfully")
+except Exception as e:
+    logger.error(f"Error loading spaCy model: {e}")
+    # Initialize a blank model as fallback
+    nlp = spacy.blank("en")
 
 # Timeout decorator
 def timeout_handler(signum, frame):
@@ -29,13 +46,15 @@ def with_timeout(timeout_seconds):
         @wraps(func)
         def wrapper(*args, **kwargs):
             # Set the timeout handler
+            original_handler = signal.getsignal(signal.SIGALRM)
             signal.signal(signal.SIGALRM, timeout_handler)
             signal.alarm(timeout_seconds)
             try:
                 result = func(*args, **kwargs)
             finally:
-                # Cancel the alarm
+                # Cancel the alarm and restore original handler
                 signal.alarm(0)
+                signal.signal(signal.SIGALRM, original_handler)
             return result
         return wrapper
     return decorator
@@ -56,42 +75,66 @@ def extract_insights_with_spacy(text):
             return {}, "Not enough text to analyze."
         
         # Truncate to avoid memory issues but ensure we have enough to analyze
-        truncated_text = text[:100000]
-        doc = nlp(truncated_text)
+        max_text_length = 50000  # Reduced from 100000 to avoid memory issues
+        truncated_text = text[:max_text_length]
         
-        # Extract entities
-        entities = {ent.text: ent.label_ for ent in doc.ents}
-        
-        # Get noun chunks for key phrases
-        noun_chunks = [chunk.text for chunk in doc.noun_chunks]
-        
-        # Generate a smarter summary using entity density
-        sentences = list(doc.sents)
+        # Process the text in chunks if it's very large
+        doc = None
+        if len(truncated_text) > 25000:
+            # Process in chunks and combine results
+            chunk_size = 10000
+            chunks = [truncated_text[i:i+chunk_size] for i in range(0, len(truncated_text), chunk_size)]
+            
+            entities = {}
+            noun_chunks = []
+            sentences = []
+            
+            for chunk in chunks:
+                chunk_doc = nlp(chunk)
+                # Collect entities from each chunk
+                for ent in chunk_doc.ents:
+                    entities[ent.text] = ent.label_
+                # Collect noun chunks from each chunk
+                noun_chunks.extend([chunk.text for chunk in chunk_doc.noun_chunks])
+                # Collect sentences from each chunk
+                sentences.extend(list(chunk_doc.sents))
+        else:
+            # Process normally for smaller texts
+            doc = nlp(truncated_text)
+            entities = {ent.text: ent.label_ for ent in doc.ents}
+            noun_chunks = [chunk.text for chunk in doc.noun_chunks]
+            sentences = list(doc.sents)
         
         # Only proceed with summary if we have sentences
         if sentences:
-            # Score sentences by the number of entities they contain
-            important_sentences = sorted(
-                sentences,
-                key=lambda s: sum(1 for ent in doc.ents if ent.start >= s.start and ent.end <= s.end),
-                reverse=True
-            )[:3]
-            
-            # Create summary
-            summary = ' '.join([sent.text for sent in important_sentences])
-            
-            # Fall back to first few sentences if no entities were found
-            if not summary:
+            # For chunked processing, we might not have doc.ents available, so we need a different approach
+            if doc is None:
+                # Just use the first few sentences as a summary for chunked processing
                 summary = ' '.join([sent.text for sent in sentences[:3]])
+            else:
+                # Score sentences by the number of entities they contain
+                important_sentences = sorted(
+                    sentences,
+                    key=lambda s: sum(1 for ent in doc.ents if ent.start >= s.start and ent.end <= s.end),
+                    reverse=True
+                )[:3]
+                
+                # Create summary
+                summary = ' '.join([sent.text for sent in important_sentences])
+                
+                # Fall back to first few sentences if no entities were found
+                if not summary:
+                    summary = ' '.join([sent.text for sent in sentences[:3]])
         else:
             # No sentences found, use the first part of text
             summary = truncated_text[:200]
         
         # Collect key medical terms if present
         medical_terms = []
-        medical_entities = [ent.text for ent in doc.ents if ent.label_ in ("DISEASE", "CONDITION", "TREATMENT", "MEDICATION")]
-        if medical_entities:
-            medical_terms = medical_entities[:5]
+        if doc is not None:
+            medical_entities = [ent.text for ent in doc.ents if ent.label_ in ("DISEASE", "CONDITION", "TREATMENT", "MEDICATION")]
+            if medical_entities:
+                medical_terms = medical_entities[:5]
         
         # Create insights dictionary
         insights = {
@@ -178,13 +221,16 @@ def extract_insights_with_sklearn(text, model_cache=None, num_topics=3):
             nmf_model = NMF(n_components=min(num_topics, dtm.shape[1]), random_state=42)
             nmf_model.fit(dtm)
             
-            # Save model
-            model_filename = os.path.join(os.getenv('MODELS_FOLDER', '.'), 'topic_model.pkl')
-            with open(model_filename, 'wb') as f:
-                pickle.dump((nmf_model, vectorizer), f)
-            
-            if model_cache is not None:
-                model_cache['topic_model'] = (nmf_model, vectorizer)
+            # Save model - with try/except to handle permission issues
+            try:
+                model_filename = os.path.join(os.getenv('MODELS_FOLDER', '.'), 'topic_model.pkl')
+                with open(model_filename, 'wb') as f:
+                    pickle.dump((nmf_model, vectorizer), f)
+                
+                if model_cache is not None:
+                    model_cache['topic_model'] = (nmf_model, vectorizer)
+            except Exception as e:
+                logger.error(f"Error saving topic model: {e}")
         
         # Extract topics
         feature_names = vectorizer.get_feature_names_out()
@@ -333,6 +379,7 @@ def extract_insights_with_transformers(text, model_cache=None):
             'summary': text[:100]
         }, "Unable to determine document sentiment.", None
 
+@with_timeout(120)  # Ensure this function never runs more than 120 seconds
 def generate_comprehensive_insights(text, file_path, images=None, model_cache=None, timeout=120):
     """
     Generate comprehensive insights from text
@@ -347,123 +394,4 @@ def generate_comprehensive_insights(text, file_path, images=None, model_cache=No
     Returns:
         dict: Dictionary of insights
     """
-    logger.info(f"Generating insights with timeout of {timeout} seconds...")
-    
-    # Initialize results with defaults
-    spacy_insights = {}
-    spacy_summary = "No text analysis available."
-    topics = []
-    topic_summary = "No topic information available."
-    transformer_results = {'sentiment': 'NEUTRAL', 'summary': ''}
-    transformer_summary = "No sentiment analysis available."
-    
-    # Validate input text
-    if not text or len(text.strip()) < 10:
-        logger.warning("Warning: Input text is too short for analysis")
-        insights_summary = "The document doesn't contain enough text for analysis."
-        return {
-            'summary': insights_summary,
-            'entities': {},
-            'key_phrases': [],
-            'topics': [],
-            'sentiment': 'NEUTRAL',
-            'transformer_summary': ''
-        }
-    
-    # Track processing time
-    start_time = time.time()
-    
-    try:
-        # Process with spaCy first (fastest)
-        logger.info("Starting spaCy analysis")
-        spacy_insights, spacy_summary = extract_insights_with_spacy(text)
-        
-        # Check for timeout
-        elapsed = time.time() - start_time
-        remaining_time = timeout - elapsed
-        logger.info(f"spaCy processing completed in {elapsed:.2f}s, remaining time: {remaining_time:.2f}s")
-        
-        if remaining_time <= 0:
-            logger.warning("Timeout reached after spaCy processing")
-            insights_summary = f"Partial analysis completed due to timeout.\n{spacy_summary}"
-            return {
-                'summary': insights_summary.strip(),
-                'entities': spacy_insights.get('entities', {}),
-                'key_phrases': spacy_insights.get('key_phrases', []),
-                'topics': [],
-                'sentiment': 'NEUTRAL',
-                'transformer_summary': ''
-            }
-        
-        # Process with sklearn for topics
-        logger.info("Starting scikit-learn topic analysis")
-        topics, topic_summary, _ = extract_insights_with_sklearn(text, model_cache)
-        
-        # Check for timeout again
-        elapsed = time.time() - start_time
-        remaining_time = timeout - elapsed
-        logger.info(f"sklearn processing completed in {elapsed:.2f}s, remaining time: {remaining_time:.2f}s")
-        
-        if remaining_time <= 0:
-            logger.warning("Timeout reached after sklearn processing")
-            insights_summary = f"""
-            DOCUMENT INSIGHTS SUMMARY:
-            
-            {spacy_summary}
-            
-            {topic_summary}
-            
-            Document appears neutral in tone.
-            """
-            return {
-                'summary': insights_summary.strip(),
-                'entities': spacy_insights.get('entities', {}),
-                'key_phrases': spacy_insights.get('key_phrases', []),
-                'topics': topics,
-                'sentiment': 'NEUTRAL',
-                'transformer_summary': ''
-            }
-        
-        # Process with transformers for sentiment and summary
-        logger.info("Starting transformer analysis")
-        transformer_results, transformer_summary, _ = extract_insights_with_transformers(text, model_cache)
-        
-        # Combine all insights into a comprehensive summary
-        insights_summary = f"""
-        DOCUMENT INSIGHTS SUMMARY:
-        
-        {spacy_summary}
-        
-        {topic_summary}
-        
-        {transformer_summary}
-        """
-
-        detailed_insights = {
-            'summary': insights_summary.strip(),
-            'entities': spacy_insights.get('entities', {}),
-            'key_phrases': spacy_insights.get('key_phrases', []),
-            'topics': topics,
-            'sentiment': transformer_results.get('sentiment', 'NEUTRAL'),
-            'transformer_summary': transformer_results.get('summary', '')
-        }
-
-        return detailed_insights
-        
-    except TimeoutError:
-        logger.error(f"Insights generation timed out after {timeout} seconds")
-        # Return whatever we've got so far
-        insights_summary = f"Analysis partially completed due to processing timeout."
-        
-        if 'spacy_summary' in locals() and spacy_summary != "No text analysis available.":
-            insights_summary += f"\n\n{spacy_summary}"
-            
-        if 'topic_summary' in locals() and topic_summary != "No topic information available.":
-            insights_summary += f"\n\n{topic_summary}"
-            
-        return {
-            'summary': insights_summary,
-            'entities': spacy_insights.get('entities', {}) if 'spacy_insights' in locals() else {},
-            'key_phrases': spacy_insights.get('key_phrases', []) if 'spacy_insights' in locals() else [],
-            'topics': topics if 'topics' in locals() else [],
-            'sentiment': transformer_results.get('sentiment', 'NEUTRAL
+    logger.info(
