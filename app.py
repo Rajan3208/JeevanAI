@@ -32,13 +32,15 @@ os.makedirs(app.config['MODELS_FOLDER'], exist_ok=True)
 # Results cache for async processing
 results_cache = {}
 
-# Load models at startup
+# Model cache for loaded models
 model_cache = {}
 
 # Initialize models at startup
-with app.app_context():
+@app.before_first_request
+def initialize_models():
     try:
         logger.info("Loading models...")
+        global model_cache
         model_cache = load_models(app.config['MODELS_FOLDER'])
         logger.info(f"Loaded {len(model_cache)} models successfully")
     except Exception as e:
@@ -83,8 +85,6 @@ def upload_file():
         os.remove(file_path)  # Clean up on error
         logger.error(f"Upload error: {str(e)}")
         return jsonify({'error': str(e)}), 500
-
-# (unchanged imports and setup...)
 
 def process_file_async(file_id, file_path):
     """Process file asynchronously and store results in cache"""
@@ -154,6 +154,7 @@ def process_file_async(file_id, file_path):
         results_cache[file_id]['status'] = 'extracting_insights'
         
         logger.info(f"Generating insights for {file_id} with {len(combined_text)} characters of text")
+        # Pass global model_cache to insights generator
         insights = generate_comprehensive_insights(
             combined_text, 
             file_path, 
@@ -205,7 +206,6 @@ def process_file_async(file_id, file_path):
                 os.remove(file_path)
         except Exception as e:
             logger.error(f"Error removing file {file_path}: {str(e)}")
-
 
 @app.route('/api/analyze/<file_id>', methods=['GET'])
 def analyze_file(file_id):
