@@ -394,4 +394,80 @@ def generate_comprehensive_insights(text, file_path, images=None, model_cache=No
     Returns:
         dict: Dictionary of insights
     """
-    logger.info(
+    logger.info(f"Generating insights for text of length {len(text)}")
+    start_time = time.time()
+    
+    # Ensure we have at least some text to analyze
+    if not text or len(text.strip()) < 20:
+        logger.warning("Text too short for analysis")
+        return {
+            'summary': "The document does not contain sufficient text for analysis.",
+            'entities': {},
+            'topics': [],
+            'sentiment': 'NEUTRAL'
+        }
+    
+    # Initialize results container
+    all_insights = {
+        'summary': "",
+        'entities': {},
+        'topics': [],
+        'key_phrases': [],
+        'sentiment': 'NEUTRAL'
+    }
+    
+    try:
+        # First, try spaCy as it's the most reliable
+        logger.info("Extracting insights with spaCy")
+        spacy_insights, spacy_summary = extract_insights_with_spacy(text)
+        
+        # Update results with spaCy insights
+        if spacy_insights:
+            all_insights['entities'] = spacy_insights.get('entities', {})
+            all_insights['key_phrases'] = spacy_insights.get('key_phrases', [])
+            all_insights['summary'] = spacy_insights.get('summary', "")
+            
+            # Check timeout
+            if time.time() - start_time > timeout * 0.6:
+                logger.warning("Time limit approaching, skipping remaining analysis")
+                return all_insights
+        
+        # Next, try topic modeling
+        logger.info("Extracting topics with scikit-learn")
+        topics_list, topics_summary, _ = extract_insights_with_sklearn(text, model_cache)
+        
+        # Update results with topic insights
+        if topics_list:
+            all_insights['topics'] = [' & '.join(topic[:3]) for topic in topics_list]
+            
+        # Check timeout
+        if time.time() - start_time > timeout * 0.8:
+            logger.warning("Time limit approaching, skipping transformer analysis")
+            return all_insights
+        
+        # Finally, try transformer models for sentiment and better summaries
+        logger.info("Extracting insights with transformers")
+        transformer_insights, transformer_summary, _ = extract_insights_with_transformers(text, model_cache)
+        
+        # Update results with transformer insights
+        if transformer_insights:
+            all_insights['sentiment'] = transformer_insights.get('sentiment', 'NEUTRAL')
+            all_insights['transformer_summary'] = transformer_insights.get('summary', "")
+            
+        # Combine all insights for the final result
+        logger.info("Finalizing insights")
+        if not all_insights['summary'] and transformer_insights and transformer_insights.get('summary'):
+            all_insights['summary'] = transformer_insights.get('summary')
+        
+        return all_insights
+    
+    except Exception as e:
+        logger.error(f"Error generating comprehensive insights: {e}")
+        # Return what we have so far, or a default response
+        if not all_insights['summary']:
+            all_insights['summary'] = "Analysis could not be completed successfully."
+        
+        return all_insights
+    
+    finally:
+        logger.info(f"Insights generation completed in {time.time() - start_time:.2f} seconds")
