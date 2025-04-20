@@ -2,10 +2,10 @@ import os
 import uuid
 import json
 import logging
-from threading import Thread
 from flask import Flask, request, jsonify
-import pickle
+from flask_cors import CORS
 from werkzeug.utils import secure_filename
+from multiprocessing import Process, Queue
 from utils.pdf_processor import convert_pdf_to_images
 from utils.text_extractor import (
     extract_text_with_pyPDF,
@@ -16,26 +16,21 @@ from utils.text_extractor import (
 from utils.insights_generator import generate_comprehensive_insights
 from utils.model_handler import load_models, upload_to_gcs
 
-# Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# Configuration
-app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', 'uploads')
+app.config['UPLOAD_FOLDER'] = os.environ.get('UPLOAD_FOLDER', '/tmp/uploads')
 app.config['MODELS_FOLDER'] = os.environ.get('MODELS_FOLDER', 'models')
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB max upload size
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 os.makedirs(app.config['MODELS_FOLDER'], exist_ok=True)
 
-# Results cache for async processing
 results_cache = {}
-
-# Model cache for loaded models
 model_cache = {}
 
-# Initialize models function - will be called separately
 def initialize_models():
     try:
         logger.info("Loading models...")
@@ -47,17 +42,11 @@ def initialize_models():
         logger.error(f"Error loading models: {str(e)}")
         return False
 
-# Call model initialization during startup, but don't block the app from starting
 @app.before_request
 def ensure_models_loaded():
     global model_cache
     if not model_cache:
-        try:
-            # Try loading models if not already loaded
-            initialize_models()
-        except Exception as e:
-            logger.error(f"Error loading models: {str(e)}")
-            # Continue without models - we'll handle missing models in the processing functions
+        initialize_models()
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -70,70 +59,72 @@ def health_check():
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
     if 'file' not in request.files:
+        logger.error("No file part in request")
         return jsonify({'error': 'No file part'}), 400
     
     file = request.files['file']
     if file.filename == '':
+        logger.error("No selected file")
         return jsonify({'error': 'No selected file'}), 400
     
-    # Handle both PDF and image files
     if not (file.filename.lower().endswith('.pdf') or 
             file.filename.lower().endswith(('.png', '.jpg', '.jpeg'))):
+        logger.error(f"Invalid file type: {file.filename}")
         return jsonify({'error': 'File must be a PDF or image (PNG, JPG)'}), 400
     
     try:
-        # Create a unique filename
         unique_filename = f"{uuid.uuid4()}_{secure_filename(file.filename)}"
         file_path = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+        logger.info(f"Saving file to {file_path}")
         file.save(file_path)
         
+        if not os.path.exists(file_path):
+            logger.error(f"File not saved: {file_path}")
+            return jsonify({'error': 'Failed to save file'}), 500
+            
         logger.info(f"File uploaded: {unique_filename}")
-        
-        # Return file ID for the next step
         return jsonify({
             'message': 'File uploaded successfully',
             'file_id': unique_filename
         }), 200
     except Exception as e:
-        logger.error(f"Upload error: {str(e)}")
-        # Make sure we don't try to remove a file that wasn't created
+        logger.error(f"Upload error: {str(e)}", exc_info=True)
         if 'file_path' in locals() and os.path.exists(file_path):
             os.remove(file_path)
-        return jsonify({'error': str(e)}), 500
+            logger.info(f"Removed failed upload: {file_path}")
+        return jsonify({'error': f"Server error: {str(e)}"}), 500
 
-def process_file_async(file_id, file_path):
-    """Process file asynchronously and store results in cache"""
+def process_file_async(file_id, file_path, result_queue):
+    """Process file and store results in queue"""
     try:
         logger.info(f"Starting async processing for {file_id}")
         results_cache[file_id]['status'] = 'processing'
         
-        # Check if file is image or PDF
         is_image = file_path.lower().endswith(('.png', '.jpg', '.jpeg'))
-        
-        # Set default empty values
         pypdf_text = ""
         langchain_pdf_text = ""
         pytesseract_text = ""
         easyocr_text = ""
         combined_text = ""
         
-        # For images, we only need OCR methods
         if is_image:
             logger.info(f"Processing image file: {file_id}")
             images = [file_path]
             
             try:
+                logger.info("Starting Pytesseract extraction")
                 pytesseract_text = extract_text_with_pytesseract(images)
                 logger.info(f"Pytesseract extraction completed with {len(pytesseract_text)} chars")
             except Exception as e:
-                logger.warning(f"Pytesseract extraction failed: {str(e)}")
+                logger.error(f"Pytesseract extraction failed: {str(e)}", exc_info=True)
                 
             try:
                 results_cache[file_id]['status'] = 'extracting_with_easyocr'
+                logger.info("Starting EasyOCR extraction")
                 easyocr_text = extract_text_with_easyocr(images)
                 logger.info(f"EasyOCR extraction completed with {len(easyocr_text)} chars")
             except Exception as e:
-                logger.warning(f"EasyOCR extraction failed: {str(e)}")
+                logger.error(f"EasyOCR extraction failed: {str(e)}", exc_info=True)
             
             combined_text = pytesseract_text + "\n" + easyocr_text
             
@@ -144,10 +135,11 @@ def process_file_async(file_id, file_path):
             
             try:
                 results_cache[file_id]['status'] = 'extracting_with_pypdf'
+                logger.info("Starting PyPDF extraction")
                 pypdf_text = extract_text_with_pyPDF(file_path)
                 logger.info(f"PyPDF extraction completed with {len(pypdf_text)} chars")
             except Exception as e:
-                logger.warning(f"PyPDF extraction failed: {str(e)}")
+                logger.error(f"PyPDF extraction failed: {str(e)}", exc_info=True)
             
             if len(pypdf_text.strip()) > 200:
                 logger.info(f"Using PyPDF extraction for {file_id}")
@@ -156,10 +148,11 @@ def process_file_async(file_id, file_path):
                 logger.info(f"PyPDF extraction insufficient, trying Langchain for {file_id}")
                 try:
                     results_cache[file_id]['status'] = 'extracting_with_langchain'
+                    logger.info("Starting Langchain extraction")
                     langchain_pdf_text = extract_text_with_langchain_pdf(file_path)
                     logger.info(f"Langchain extraction completed with {len(langchain_pdf_text)} chars")
                 except Exception as e:
-                    logger.warning(f"Langchain extraction failed: {str(e)}")
+                    logger.error(f"Langchain extraction failed: {str(e)}", exc_info=True)
                 
                 if len(langchain_pdf_text.strip()) > 200:
                     combined_text = langchain_pdf_text
@@ -167,27 +160,29 @@ def process_file_async(file_id, file_path):
                     logger.info(f"Text extraction failed, using OCR for {file_id}")
                     try:
                         results_cache[file_id]['status'] = 'extracting_with_ocr'
+                        logger.info("Converting PDF to images for OCR")
                         images = convert_pdf_to_images(file_path)
+                        logger.info("Starting Pytesseract extraction for PDF")
                         pytesseract_text = extract_text_with_pytesseract(images)
+                        logger.info("Starting EasyOCR extraction for PDF")
                         easyocr_text = extract_text_with_easyocr(images)
                         combined_text = pytesseract_text + "\n" + easyocr_text
                     except Exception as e:
-                        logger.error(f"OCR extraction failed: {str(e)}")
+                        logger.error(f"OCR extraction failed: {str(e)}", exc_info=True)
                         combined_text = pypdf_text + "\n" + langchain_pdf_text
         
-        # Ensure we have at least some text
         if len(combined_text.strip()) < 10:
-            logger.warning(f"Very little text extracted from file: {file_id}")
+            logger.error(f"Very little text extracted from file: {file_id}")
             results_cache[file_id] = {
                 'status': 'error',
                 'error': 'Could not extract sufficient text from document'
             }
+            result_queue.put(results_cache[file_id])
             return
             
         results_cache[file_id]['status'] = 'extracting_insights'
         
         logger.info(f"Generating insights for {file_id} with {len(combined_text)} characters of text")
-        # Pass global model_cache to insights generator
         insights = generate_comprehensive_insights(
             combined_text, 
             file_path, 
@@ -205,7 +200,6 @@ def process_file_async(file_id, file_path):
                 'sentiment': 'NEUTRAL'
             }
 
-        # Prepare response
         result = {
             'file_id': file_id,
             'text_length': len(combined_text),
@@ -226,13 +220,15 @@ def process_file_async(file_id, file_path):
         }
 
         logger.info(f"Processing complete for {file_id}")
+        result_queue.put(results_cache[file_id])
 
     except Exception as e:
-        logger.error(f"Error processing {file_id}: {str(e)}")
+        logger.error(f"Error processing {file_id}: {str(e)}", exc_info=True)
         results_cache[file_id] = {
             'status': 'error',
             'error': str(e)
         }
+        result_queue.put(results_cache[file_id])
     finally:
         try:
             if os.path.exists(file_path):
@@ -243,38 +239,33 @@ def process_file_async(file_id, file_path):
 
 @app.route('/api/analyze/<file_id>', methods=['GET'])
 def analyze_file(file_id):
-    # Check if file is being processed or is complete
     if file_id in results_cache:
         cache_entry = results_cache[file_id]
         status = cache_entry.get('status')
         
         if status == 'complete':
-            # Processing is complete, return result
             return jsonify(cache_entry['result']), 200
         elif status == 'error':
-            # Error occurred during processing
-            return jsonify({'error': cache_entry.get('error', 'Unknown error')}), 500
+            return jsonify({'error': cache_entry.get('error', 'Unknown error'), 'file_id': file_id}), 500
         else:
-            # Still processing - include more detailed status
             return jsonify({
                 'status': 'processing', 
                 'stage': status if status != 'processing' else 'extracting_text',
                 'file_id': file_id
             }), 202
     
-    # File hasn't been submitted for processing yet
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], file_id)
     
     if not os.path.exists(file_path):
-        return jsonify({'error': 'File not found'}), 404
+        return jsonify({'error': 'File not found', 'file_id': file_id}), 404
     
-    # Initialize cache entry and start processing
     results_cache[file_id] = {'status': 'initializing'}
     
-    # Start async processing
-    thread = Thread(target=process_file_async, args=(file_id, file_path))
-    thread.daemon = True  # Make thread a daemon so it doesn't block app shutdown
-    thread.start()
+    # Use multiprocessing instead of threading
+    result_queue = Queue()
+    process = Process(target=process_file_async, args=(file_id, file_path, result_queue))
+    process.daemon = True
+    process.start()
     
     return jsonify({'status': 'processing', 'file_id': file_id}), 202
 
@@ -284,9 +275,10 @@ def check_status(file_id):
         status = results_cache[file_id].get('status')
         response = {'status': status, 'file_id': file_id}
         
-        # Include error message if there was an error
-        if status == 'error' and 'error' in results_cache[file_id]:
-            response['error'] = results_cache[file_id]['error']
+        if status == 'error':
+            response['error'] = results_cache[file_id].get('error', 'Unknown error')
+        elif status == 'complete':
+            response['result'] = results_cache[file_id].get('result')
             
         return jsonify(response), 200
     
@@ -304,7 +296,6 @@ def upload_models_to_gcs():
         if not bucket_name:
             return jsonify({'error': 'Bucket name is required'}), 400
         
-        # Upload models to GCS
         uploaded_files = upload_to_gcs(
             app.config['MODELS_FOLDER'], 
             bucket_name
@@ -318,17 +309,13 @@ def upload_models_to_gcs():
         logger.error(f"GCS upload error: {str(e)}")
         return jsonify({'error': str(e)}), 500
 
-# Periodically clean up old cache entries
 @app.route('/api/cleanup', methods=['POST'])
 def cleanup_cache():
     try:
-        # Remove entries older than specified time
         removed = 0
         current_size = len(results_cache) 
         
-        # Keep only the 100 most recent entries if we have more than 150
         if current_size > 150:
-            # This is a simple approach - in production you'd track timestamps
             keys_to_remove = list(results_cache.keys())[:-100]
             for key in keys_to_remove:
                 del results_cache[key]
@@ -342,10 +329,6 @@ def cleanup_cache():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    # Initialize models before starting the server
     initialize_models()
-    
-    # Use this for local development
     port = int(os.environ.get('PORT', 8080))
-    # In production, we should use a proper WSGI server instead of the Flask dev server
-    app.run(host='0.0.0.0', port=port, threaded=True)
+    app.run(host='0.0.0.0', port=port)
