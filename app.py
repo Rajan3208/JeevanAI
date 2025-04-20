@@ -161,14 +161,14 @@ def process_file_async(file_id, file_path):
         # Update status to show text extraction complete
         results_cache[file_id]['status'] = 'extracting_insights'
         
-        # Generate insights with a timeout - INCREASED TO 180 SECONDS
+        # Generate insights with timeout
         logger.info(f"Generating insights for {file_id} with {len(combined_text)} characters of text")
         insights = generate_comprehensive_insights(
             combined_text, 
             file_path, 
             None,  # Only pass images if needed
             model_cache,
-            timeout=180  # Increased timeout for inference from 120 to 180
+            timeout=180  # Timeout for inference (180 seconds)
         )
         
         # If insights generation failed, provide at least some basic information
